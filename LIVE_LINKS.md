@@ -1,6 +1,6 @@
-# 📱 Live AVD links — run 39006187261 (started 2026-10-17 05:29 UTC)
+# 📱 Live AVD links — run 39013686971 (started 2026-10-17 07:30 UTC)
 
-- 🎮 Control the device (ws-scrcpy): **https://washington-characteristic-descending-disciplinary.trycloudflare.com**
-- 🛠 Dashboard (APK upload · clipboard): **https://essays-img-injuries-gabriel.trycloudflare.com**
+- 🎮 Control the device (ws-scrcpy): **https://bay-likes-mating-mode.trycloudflare.com**
+- 🛠 Dashboard (APK upload · clipboard): **https://circulation-warned-sandwich-doctors.trycloudflare.com**
 
 Links change on every run and die when the session ends.
