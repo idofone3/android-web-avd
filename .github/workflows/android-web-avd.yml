@@ -99,12 +99,24 @@ jobs:
             -k "system-images;android-${API};google_apis;x86_64" \
             -d "$DEV" --force
 
-          CFG="$HOME/.android/avd/webavd.avd/config.ini"
+          # Locate the created AVD (some images resolve AVD home via env vars)
+          echo "ANDROID_AVD_HOME=${ANDROID_AVD_HOME:-unset} · ANDROID_USER_HOME=${ANDROID_USER_HOME:-unset}"
+          "$AVDMGR" list avd 2>/dev/null || true
+          AVD_DIR=$("$AVDMGR" list avd 2>/dev/null | grep -m1 "Path:" | sed 's/.*Path: //; s/[[:space:]]*$//')
+          if [ -z "$AVD_DIR" ] || [ ! -d "$AVD_DIR" ]; then
+            AVD_DIR=$(find "$HOME" -maxdepth 5 -type d -name webavd.avd 2>/dev/null | head -n1)
+          fi
+          if [ -z "$AVD_DIR" ] || [ ! -d "$AVD_DIR" ]; then
+            echo "::error::AVD directory not found after avdmanager create"
+            ls -la "$HOME/.android" 2>/dev/null || true
+            exit 1
+          fi
+          echo "AVD dir: $AVD_DIR"
           {
             echo "hw.keyboard=yes"
             echo "hw.gpu.enabled=yes"
             echo "hw.gpu.mode=swiftshader_indirect"
-          } >> "$CFG"
+          } >> "$AVD_DIR/config.ini"
 
           ACCEL="-accel on"
           [ -e /dev/kvm ] || ACCEL="-no-accel"
