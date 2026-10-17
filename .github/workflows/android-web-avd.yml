@@ -593,9 +593,21 @@ jobs:
           printf '%s\n' "$S" > /tmp/scrcpy_url
           printf '%s\n' "$D" > /tmp/dash_url
           printf '{"scrcpy":"%s","dashboard":"%s"}\n' "$S" "$D" > /tmp/session_urls.json
+
+          # One-click deep links: connect straight to emulator-5554 with a chosen player.
+          # ws-scrcpy 0.9.0-dev URL-hash API: #action=stream&udid=<serial>&player=<codeName>&ws=<tracker-ws-url>
+          HOST="${S#https://}"
+          WSE=$(jq -rn --arg s "wss://${HOST}/?action=goog-device-list" '$s|@uri')
+          DIRECT_H264="$S/#action=stream&udid=emulator-5554&player=mse&ws=$WSE&fitToScreen=1"
+          DIRECT_WC="$S/#action=stream&udid=emulator-5554&player=webcodecs&ws=$WSE&fitToScreen=1"
+          printf '%s\n' "$DIRECT_H264" > /tmp/direct_h264
+          printf '%s\n' "$DIRECT_WC" > /tmp/direct_wc
+
           cat > /tmp/session_info.txt <<EOF
           ws-scrcpy : $S
           Dashboard : $D
+          Direct (H264/MSE, one click): $DIRECT_H264
+          Direct (WebCodecs, fastest): $DIRECT_WC
           Started (UTC): $(date -u '+%Y-%m-%d %H:%M')
           Android API: $API · Session: $DURATION_MIN min
           EOF
@@ -612,6 +624,11 @@ jobs:
               echo
               echo "- 🎮 Control the device (ws-scrcpy): **$S**"
               echo "- 🛠 Dashboard (APK upload · clipboard): **$D**"
+              echo "- ⚡ ONE-CLICK screen (H264/MSE player): [Open device screen]($DIRECT_H264)"
+              echo "- ⚡ ONE-CLICK screen (WebCodecs, fastest): [Open device screen]($DIRECT_WC)"
+              echo
+              echo "One-click links open the stream for emulator-5554 directly — no dropdowns needed."
+              echo "If they fail, open $S, click emulator-5554, then pick the player named H264 Converter (that IS H264)."
               echo
               echo "Links change on every run and die when the session ends."
             } > LIVE_LINKS.md
@@ -631,9 +648,12 @@ jobs:
             echo "|------|------|"
             echo "| 🎮 **Control the device** (ws-scrcpy) | [$S]($S) |"
             echo "| 🛠 **Dashboard** — APK upload · clipboard · status | [$D]($D) |"
+            echo "| ⚡ **ONE-CLICK screen** — H264/MSE player (recommended) | [Open device screen]($DIRECT_H264) |"
+            echo "| ⚡ **ONE-CLICK screen** — WebCodecs player (fastest) | [Open device screen]($DIRECT_WC) |"
             echo ""
             echo "**How to use**"
-            echo "1. Open the ws-scrcpy link → pick the device → choose client **H264** (smoothest) or **MJPEG** → **Connect**."
+            echo "1. Easiest: open a **ONE-CLICK screen** link above — it connects to \`emulator-5554\` automatically."
+            echo "   (Manual way: open the ws-scrcpy link → click \`emulator-5554\` → on the parameters page pick player **H264 Converter** — that IS the H264 client → **Start**.)"
             echo "2. Control the device with mouse + keyboard; the toolbar has Home / Back / Rotate / Volume."
             echo "3. To install an app, open the Dashboard link and drop an \`.apk\` into the upload zone."
             echo ""
