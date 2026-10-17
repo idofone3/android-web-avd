@@ -84,6 +84,12 @@ jobs:
           SDKM="$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
           AVDMGR="$SDK_ROOT/cmdline-tools/latest/bin/avdmanager"
 
+          # Pin the AVD home: avdmanager (new SDK tools) defaults to the XDG path
+          # (~/.config/.android) while the emulator searches $HOME/.android/avd.
+          # Without this the emulator cannot find AVDs the manager creates.
+          export ANDROID_AVD_HOME="$HOME/.android/avd"
+          mkdir -p "$ANDROID_AVD_HOME"
+
           yes | "$SDKM" --licenses >/dev/null 2>&1 || true
           yes | "$SDKM" --channel=0 "platform-tools" "emulator" \
             "system-images;android-${API};google_apis;x86_64" >/dev/null
@@ -125,7 +131,16 @@ jobs:
             -no-window -no-audio -no-boot-anim -no-snapshot \
             -gpu swiftshader_indirect -memory 4096 -cores 4 \
             > /tmp/emulator.log 2>&1 &
-          echo "Emulator PID: $!"
+          EMU_PID=$!
+          echo "Emulator PID: $EMU_PID"
+
+          # Fast-fail if the emulator died immediately (e.g. bad AVD / flags)
+          sleep 10
+          if ! kill -0 "$EMU_PID" 2>/dev/null; then
+            echo "::error::Emulator process exited immediately — log follows"
+            tail -n 60 /tmp/emulator.log || true
+            exit 1
+          fi
 
           if ! timeout 900 bash -c 'while true; do
               boot=$("$ADB" shell getprop sys.boot_completed 2>/dev/null | tr -d "\r")
