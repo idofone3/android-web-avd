@@ -179,8 +179,7 @@ jobs:
           set -e
           mkdir -p /home/runner/ws-scrcpy
           cd /home/runner/ws-scrcpy
-          git clone -q --depth 1 --branch v2.3.1 https://github.com/NetrisTV/ws-scrcpy.git app 2>/dev/null \
-            || git clone -q --depth 1 https://github.com/NetrisTV/ws-scrcpy.git app
+          git clone -q --depth 1 https://github.com/NetrisTV/ws-scrcpy.git app
           cd app
           npm install --no-audit --no-fund --loglevel=error
 
@@ -279,18 +278,22 @@ jobs:
           PYEOF_UI
 
           python3 /tmp/patch_ui.py "$PWD"
-          (npm run build 2>/dev/null || npm run build:prod || npm run build:dev)
+          npm run dist:prod || npm run dist || true   # pre-build (npm start can also do it)
           python3 /tmp/patch_ui.py "$PWD"   # cover dist/ output too
 
-          nohup npm start > /tmp/wsscrcpy.log 2>&1 &
-          for i in $(seq 1 30); do
+          if [ -f dist/index.js ]; then
+            nohup node --max-old-space-size=4096 dist/index.js > /tmp/wsscrcpy.log 2>&1 &
+          else
+            nohup npm start > /tmp/wsscrcpy.log 2>&1 &   # builds (npm run dist) then starts
+          fi
+          for i in $(seq 1 75); do
             curl -sf "http://localhost:${SCRCPY_PORT}" >/dev/null 2>&1 && break
             sleep 4
           done
           if ! curl -sf "http://localhost:${SCRCPY_PORT}" >/dev/null 2>&1; then
-            if [ -f dist/index.js ]; then
+            if [ -f dist/index.js ] && ! pgrep -f "dist/index.js" >/dev/null; then
               nohup node --max-old-space-size=4096 dist/index.js > /tmp/wsscrcpy.log 2>&1 &
-              sleep 12
+              sleep 15
             fi
           fi
           curl -sf "http://localhost:${SCRCPY_PORT}" >/dev/null 2>&1 \
