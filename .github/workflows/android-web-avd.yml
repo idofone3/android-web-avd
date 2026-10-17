@@ -301,6 +301,57 @@ jobs:
           echo "✅ ws-scrcpy is up on :${SCRCPY_PORT} (Font Awesome theme injected)"
 
       # ---------------------------------------------------------------------
+      - name: "2b · Start scrcpy video server on device (required for the video stream)"
+        run: |
+          set -e
+          # ws-scrcpy 0.9.0-dev does NOT auto-start the device-side scrcpy server.
+          # The UI's "Start server" button runs exactly this command; we replicate it
+          # here (and in the keep-alive watchdog) so video works without manual clicks.
+          cat > /tmp/ensure_scrcpy_server.sh <<'SSEOF'
+          #!/usr/bin/env bash
+          SERIAL="emulator-5554"
+          ADB_BIN="${ADB:-$ANDROID_HOME/platform-tools/adb}"
+          [ -x "$ADB_BIN" ] || ADB_BIN="$(command -v adb)"
+          JAR="/home/runner/ws-scrcpy/app/dist/vendor/Genymobile/scrcpy/scrcpy-server.jar"
+          [ -f "$JAR" ] || JAR="/home/runner/ws-scrcpy/app/vendor/Genymobile/scrcpy/scrcpy-server.jar"
+
+          probe_8886() {
+            "$ADB_BIN" -s "$SERIAL" forward --remove tcp:18886 >/dev/null 2>&1 || true
+            "$ADB_BIN" -s "$SERIAL" forward tcp:18886 tcp:8886 >/dev/null 2>&1 || return 1
+            (exec 3<>/dev/tcp/127.0.0.1/18886) 2>/dev/null || return 1
+            exec 3>&- 3<&- 2>/dev/null
+            return 0
+          }
+
+          if probe_8886; then
+            echo "scrcpy server: OK (port 8886 listening)"
+            exit 0
+          fi
+
+          echo "scrcpy server: not listening — starting…"
+          [ -f "$JAR" ] || { echo "ERROR: scrcpy-server.jar not found at $JAR"; exit 1; }
+          "$ADB_BIN" -s "$SERIAL" push "$JAR" /data/local/tmp/scrcpy-server.jar >/dev/null
+          pkill -f "scrcpy.Server 1.19-ws8" 2>/dev/null || true
+          sleep 1
+          # Exact launch command used by ws-scrcpy's ControlCenter (src/common/Constants.ts):
+          #   CLASSPATH=/data/local/tmp/scrcpy-server.jar nohup app_process / com.genymobile.scrcpy.Server 1.19-ws8 web ERROR 8886 true
+          nohup "$ADB_BIN" -s "$SERIAL" shell \
+            "CLASSPATH=/data/local/tmp/scrcpy-server.jar nohup app_process / com.genymobile.scrcpy.Server 1.19-ws8 web ERROR 8886 true 2>&1 > /dev/null" \
+            > /tmp/scrcpy_server.log 2>&1 &
+          for i in $(seq 1 20); do
+            sleep 2
+            if probe_8886; then echo "scrcpy server: STARTED (port 8886 listening)"; exit 0; fi
+          done
+          echo "ERROR: scrcpy server failed to start — runner-side log:"
+          tail -n 30 /tmp/scrcpy_server.log || true
+          "$ADB_BIN" -s "$SERIAL" shell "logcat -d -t 40 2>/dev/null | grep -iE 'scrcpy|Server'" || true
+          exit 1
+          SSEOF
+          chmod +x /tmp/ensure_scrcpy_server.sh
+          /tmp/ensure_scrcpy_server.sh
+          echo "✅ device-side scrcpy video server ensured (proxy target tcp:8886)"
+
+      # ---------------------------------------------------------------------
       - name: "3 · Start web dashboard (APK upload · clipboard · status)"
         run: |
           set -e
@@ -595,11 +646,14 @@ jobs:
           printf '{"scrcpy":"%s","dashboard":"%s"}\n' "$S" "$D" > /tmp/session_urls.json
 
           # One-click deep links: connect straight to emulator-5554 with a chosen player.
-          # ws-scrcpy 0.9.0-dev URL-hash API: #action=stream&udid=<serial>&player=<codeName>&ws=<tracker-ws-url>
+          # ws-scrcpy 0.9.0-dev URL-hash API: #!action=stream&udid=<serial>&player=<codeName>&ws=<proxy ws url>
+          # The ws param must be the SAME url the UI uses for the "proxy over adb" interface
+          # (data-url in the device row): wss://<host>/?action=proxy-adb&remote=tcp%3A8886&udid=<serial>
+          # (the device-side scrcpy server on port 8886 is started by step 2b + keep-alive watchdog).
           HOST="${S#https://}"
-          WSE=$(jq -rn --arg s "wss://${HOST}/?action=goog-device-list" '$s|@uri')
-          DIRECT_H264="$S/#action=stream&udid=emulator-5554&player=mse&ws=$WSE&fitToScreen=1"
-          DIRECT_WC="$S/#action=stream&udid=emulator-5554&player=webcodecs&ws=$WSE&fitToScreen=1"
+          WSE=$(jq -rn --arg s "wss://${HOST}/?action=proxy-adb&remote=tcp%3A8886&udid=emulator-5554" '$s|@uri')
+          DIRECT_H264="$S/#!action=stream&udid=emulator-5554&player=mse&ws=$WSE&fitToScreen=1"
+          DIRECT_WC="$S/#!action=stream&udid=emulator-5554&player=webcodecs&ws=$WSE&fitToScreen=1"
           printf '%s\n' "$DIRECT_H264" > /tmp/direct_h264
           printf '%s\n' "$DIRECT_WC" > /tmp/direct_wc
 
@@ -716,6 +770,7 @@ jobs:
             curl -sf -o /dev/null "http://localhost:${SCRCPY_PORT}" || echo "WARN: ws-scrcpy not responding"
             curl -sf -o /dev/null "http://localhost:${DASH_PORT}" || echo "WARN: dashboard not responding"
             "$ADB" shell echo device-ok >/dev/null 2>&1 || echo "WARN: device not responding"
+            /tmp/ensure_scrcpy_server.sh || echo "WARN: scrcpy video server unhealthy (relaunch attempted)"
             sleep 300
           done
 
