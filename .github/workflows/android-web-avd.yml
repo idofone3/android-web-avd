@@ -312,6 +312,8 @@ jobs:
           SERIAL="emulator-5554"
           ADB_BIN="${ADB:-$ANDROID_HOME/platform-tools/adb}"
           [ -x "$ADB_BIN" ] || ADB_BIN="$(command -v adb)"
+          # display must stay awake or the encoder produces nothing
+          "$ADB_BIN" -s "$SERIAL" shell "svc power stayon true; input keyevent KEYCODE_WAKEUP; wm dismiss-keyguard" >/dev/null 2>&1 || true
           JAR="/home/runner/ws-scrcpy/app/dist/vendor/Genymobile/scrcpy/scrcpy-server.jar"
           [ -f "$JAR" ] || JAR="/home/runner/ws-scrcpy/app/vendor/Genymobile/scrcpy/scrcpy-server.jar"
 
@@ -358,8 +360,17 @@ jobs:
           exit 1
           SSEOF
           chmod +x /tmp/ensure_scrcpy_server.sh
+
+          # Keep the display ON: scrcpy encodes the display surface — an OFF screen
+          # produces ZERO frames (black stream). Emulator is always "charging",
+          # so stayon=true keeps the screen lit for the whole session.
+          "$ADB" shell input keyevent KEYCODE_WAKEUP || true
+          "$ADB" shell svc power stayon true || true
+          "$ADB" shell settings put system screen_off_timeout 2147483647 || true
+          "$ADB" shell wm dismiss-keyguard || true
+
           /tmp/ensure_scrcpy_server.sh
-          echo "✅ device-side scrcpy video server ensured (proxy target tcp:8886)"
+          echo "✅ device-side scrcpy video server ensured (proxy target tcp:8886); display kept ON"
 
       # ---------------------------------------------------------------------
       - name: "3 · Start web dashboard (APK upload · clipboard · status)"
