@@ -605,7 +605,7 @@ jobs:
           git config --global user.email "actions@users.noreply.github.com"
           git config --global init.defaultBranch main
           rm -rf /tmp/repo-push
-          if git clone -q "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" /tmp/repo-push 2>/dev/null; then
+          if git clone -q "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${GITHUB_REPOSITORY}.git" /tmp/repo-push 2>/dev/null; then
             cd /tmp/repo-push
             {
               echo "# 📱 Live AVD links — run $GITHUB_RUN_ID (started $(date -u '+%Y-%m-%d %H:%M') UTC)"
@@ -642,6 +642,20 @@ jobs:
 
           echo "::notice::ws-scrcpy (control device): $S"
           echo "::notice::Dashboard (APK / clipboard): $D"
+
+      # ---------------------------------------------------------------------
+      - name: "4b · Stage live links for artifact upload"
+        if: always()
+        run: |
+          [ -f /tmp/session_info.txt ] && cp /tmp/session_info.txt "$GITHUB_WORKSPACE/LIVE_LINKS.txt" || true
+
+      - name: "4c · Upload live-links artifact (fetchable mid-session)"
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: live-links
+          path: LIVE_LINKS.txt
+          if-no-files-found: ignore
 
       # ---------------------------------------------------------------------
       - name: "5 · Start screen recorder"
