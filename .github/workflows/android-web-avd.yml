@@ -70,7 +70,19 @@ jobs:
           set -e
           echo "## 📱 Android AVD — browser session" >> "$GITHUB_STEP_SUMMARY"
           if [ -e /dev/kvm ]; then
-            echo "✅ KVM detected — emulator will run at near-native speed." >> "$GITHUB_STEP_SUMMARY"
+            if [ -w /dev/kvm ]; then
+              echo "✅ KVM detected — emulator will run at near-native speed." >> "$GITHUB_STEP_SUMMARY"
+            else
+              # /dev/kvm exists but the runner user lacks permission — fix perms
+              sudo chmod 666 /dev/kvm 2>/dev/null \
+                || { echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules >/dev/null; sudo udevadm control --reload-rules; sudo udevadm trigger --name-match=kvm; } \
+                || true
+              if [ -w /dev/kvm ]; then
+                echo "✅ KVM detected (fixed /dev/kvm permissions) — near-native speed." >> "$GITHUB_STEP_SUMMARY"
+              else
+                echo "⚠️ /dev/kvm present but not usable — falling back to software emulation (slower)." >> "$GITHUB_STEP_SUMMARY"
+              fi
+            fi
           else
             echo "⚠️ No /dev/kvm on this runner — falling back to software emulation (slower)." >> "$GITHUB_STEP_SUMMARY"
           fi
@@ -125,7 +137,8 @@ jobs:
           } >> "$AVD_DIR/config.ini"
 
           ACCEL="-accel on"
-          [ -e /dev/kvm ] || ACCEL="-no-accel"
+          { [ -e /dev/kvm ] && [ -w /dev/kvm ]; } || ACCEL="-no-accel"
+          echo "Acceleration: $ACCEL"
 
           nohup "$SDK_ROOT/emulator/emulator" -avd webavd $ACCEL \
             -no-window -no-audio -no-boot-anim -no-snapshot \
