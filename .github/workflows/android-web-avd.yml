@@ -47,7 +47,7 @@ concurrency:
   cancel-in-progress: true
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   avd:
@@ -599,6 +599,29 @@ jobs:
           Started (UTC): $(date -u '+%Y-%m-%d %H:%M')
           Android API: $API · Session: $DURATION_MIN min
           EOF
+
+          # Publish the live links into the repo so they are fetchable any time:
+          git config --global user.name "avd-session-bot"
+          git config --global user.email "actions@users.noreply.github.com"
+          git config --global init.defaultBranch main
+          rm -rf /tmp/repo-push
+          if git clone -q "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" /tmp/repo-push 2>/dev/null; then
+            cd /tmp/repo-push
+            {
+              echo "# 📱 Live AVD links — run $GITHUB_RUN_ID (started $(date -u '+%Y-%m-%d %H:%M') UTC)"
+              echo
+              echo "- 🎮 Control the device (ws-scrcpy): **$S**"
+              echo "- 🛠 Dashboard (APK upload · clipboard): **$D**"
+              echo
+              echo "Links change on every run and die when the session ends."
+            } > LIVE_LINKS.md
+            git add LIVE_LINKS.md
+            git commit -qm "Update live AVD links [skip ci]" || true
+            git push -q origin HEAD || echo "WARN: could not push LIVE_LINKS.md"
+            cd - >/dev/null
+          else
+            echo "WARN: could not clone repo for LIVE_LINKS.md"
+          fi
 
           {
             echo ""
