@@ -315,16 +315,17 @@ jobs:
           JAR="/home/runner/ws-scrcpy/app/dist/vendor/Genymobile/scrcpy/scrcpy-server.jar"
           [ -f "$JAR" ] || JAR="/home/runner/ws-scrcpy/app/vendor/Genymobile/scrcpy/scrcpy-server.jar"
 
-          probe_8886() {
-            "$ADB_BIN" -s "$SERIAL" forward --remove tcp:18886 >/dev/null 2>&1 || true
-            "$ADB_BIN" -s "$SERIAL" forward tcp:18886 tcp:8886 >/dev/null 2>&1 || return 1
-            (exec 3<>/dev/tcp/127.0.0.1/18886) 2>/dev/null || return 1
-            exec 3>&- 3<&- 2>/dev/null
-            return 0
+          # Real on-device listening check (adb forward probes are unreliable:
+          # the TCP handshake completes against the adb server, not the device).
+          port_listening() {
+            "$ADB_BIN" -s "$SERIAL" shell "netstat -tln 2>/dev/null" 2>/dev/null | grep -q ":8886 " && return 0
+            "$ADB_BIN" -s "$SERIAL" shell "cat /proc/net/tcp /proc/net/tcp6 2>/dev/null" 2>/dev/null \
+              | awk '$2 ~ /:22B6$/ && $4 == "0A" {found=1} END {exit !found}' && return 0
+            return 1
           }
 
-          if probe_8886; then
-            echo "scrcpy server: OK (port 8886 listening)"
+          if port_listening; then
+            echo "scrcpy server: OK (port 8886 listening on device)"
             exit 0
           fi
 
@@ -333,18 +334,27 @@ jobs:
           "$ADB_BIN" -s "$SERIAL" push "$JAR" /data/local/tmp/scrcpy-server.jar >/dev/null
           pkill -f "scrcpy.Server 1.19-ws8" 2>/dev/null || true
           sleep 1
-          # Exact launch command used by ws-scrcpy's ControlCenter (src/common/Constants.ts):
+          # Launch exactly like ws-scrcpy's ControlCenter (src/common/Constants.ts):
           #   CLASSPATH=/data/local/tmp/scrcpy-server.jar nohup app_process / com.genymobile.scrcpy.Server 1.19-ws8 web ERROR 8886 true
+          # The runner-side `adb shell` stays attached for the process lifetime (no inner
+          # output redirect: server logs land in /tmp/scrcpy_server.log for diagnostics).
           nohup "$ADB_BIN" -s "$SERIAL" shell \
-            "CLASSPATH=/data/local/tmp/scrcpy-server.jar nohup app_process / com.genymobile.scrcpy.Server 1.19-ws8 web ERROR 8886 true 2>&1 > /dev/null" \
+            "CLASSPATH=/data/local/tmp/scrcpy-server.jar nohup app_process / com.genymobile.scrcpy.Server 1.19-ws8 web ERROR 8886 true" \
             > /tmp/scrcpy_server.log 2>&1 &
+          started=""
           for i in $(seq 1 20); do
             sleep 2
-            if probe_8886; then echo "scrcpy server: STARTED (port 8886 listening)"; exit 0; fi
+            if port_listening; then echo "scrcpy server: STARTED (port 8886 listening)"; exit 0; fi
           done
-          echo "ERROR: scrcpy server failed to start — runner-side log:"
-          tail -n 30 /tmp/scrcpy_server.log || true
-          "$ADB_BIN" -s "$SERIAL" shell "logcat -d -t 40 2>/dev/null | grep -iE 'scrcpy|Server'" || true
+
+          echo "::error::scrcpy server failed to start — dumping diagnostics"
+          echo "--- /tmp/scrcpy_server.log ---"
+          cat /tmp/scrcpy_server.log 2>/dev/null || true
+          echo "--- foreground 12s run (server's own stderr) ---"
+          timeout 12 "$ADB_BIN" -s "$SERIAL" shell \
+            "CLASSPATH=/data/local/tmp/scrcpy-server.jar app_process / com.genymobile.scrcpy.Server 1.19-ws8 web info 8886 true" 2>&1 | head -50 || true
+          echo "--- logcat tail ---"
+          "$ADB_BIN" -s "$SERIAL" shell "logcat -d 2>/dev/null | grep -iE 'scrcpy|app_process' | tail -40" || true
           exit 1
           SSEOF
           chmod +x /tmp/ensure_scrcpy_server.sh
