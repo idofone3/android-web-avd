@@ -1,0 +1,654 @@
+name: "Android AVD in browser (ws-scrcpy)"
+
+# ---------------------------------------------------------------------------
+# Boots a full Android emulator (AVD) on a GitHub-hosted runner, streams it to
+# your browser through ws-scrcpy (UI beautified with Font Awesome), and opens
+# Cloudflare quick-tunnels so you can control it from anywhere.
+#
+# Extras built in:
+#   - Web dashboard (APK upload + install, clipboard sync, live device status)
+#   - Screen recording (rolling ~4 GB window) uploaded as an artifact
+#   - KVM auto-detection with graceful fallback
+#
+# Just drop this file into .github/workflows/ and press "Run workflow".
+# ---------------------------------------------------------------------------
+
+on:
+  workflow_dispatch:
+    inputs:
+      api:
+        description: "Android system image (API level)"
+        required: false
+        default: "35"
+        type: choice
+        options:
+          - "35"
+          - "34"
+          - "33"
+          - "30"
+      duration_minutes:
+        description: "Session length in minutes (GitHub hard max = 360)"
+        required: false
+        default: "360"
+        type: choice
+        options:
+          - "60"
+          - "120"
+          - "240"
+          - "360"
+      record:
+        description: "Record the device screen and upload it as an artifact"
+        required: false
+        default: true
+        type: boolean
+
+concurrency:
+  group: android-avd-browser
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  avd:
+    name: Boot AVD + expose via browser
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    env:
+      API: ${{ inputs.api || '35' }}
+      DURATION_MIN: ${{ inputs.duration_minutes || '360' }}
+      RECORD: ${{ inputs.record && '1' || '0' }}
+      SDK_ROOT: /usr/local/lib/android/sdk
+      ADB: /usr/local/lib/android/sdk/platform-tools/adb
+      REC_DIR: /home/runner/rec
+      SCRCPY_PORT: "8000"
+      DASH_PORT: "8080"
+    steps:
+      # ---------------------------------------------------------------------
+      - name: "0 · Preflight (KVM / SDK check)"
+        run: |
+          set -e
+          echo "## 📱 Android AVD — browser session" >> "$GITHUB_STEP_SUMMARY"
+          if [ -e /dev/kvm ]; then
+            echo "✅ KVM detected — emulator will run at near-native speed." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "⚠️ No /dev/kvm on this runner — falling back to software emulation (slower)." >> "$GITHUB_STEP_SUMMARY"
+          fi
+          "$ADB" start-server || true
+          echo "Runner: $(uname -m) · $(nproc) cores · $(free -h | awk '/Mem/{print $2}') RAM"
+
+      # ---------------------------------------------------------------------
+      - name: "1 · Create and boot the AVD"
+        run: |
+          set -e
+          SDKM="$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
+          AVDMGR="$SDK_ROOT/cmdline-tools/latest/bin/avdmanager"
+
+          yes | "$SDKM" --licenses >/dev/null 2>&1 || true
+          yes | "$SDKM" --channel=0 "platform-tools" "emulator" \
+            "system-images;android-${API};google_apis;x86_64" >/dev/null
+
+          # Pick the newest Pixel profile this SDK knows (Pixel 8 preferred).
+          DEV="pixel_6"
+          for d in pixel_8 pixel_8_pro pixel_7 pixel_6; do
+            if "$AVDMGR" list device 2>/dev/null | grep -q "\"$d\""; then DEV="$d"; break; fi
+          done
+          echo "Device profile: $DEV"
+
+          echo no | "$AVDMGR" create avd -n webavd \
+            -k "system-images;android-${API};google_apis;x86_64" \
+            -d "$DEV" --force
+
+          CFG="$HOME/.android/avd/webavd.avd/config.ini"
+          {
+            echo "hw.keyboard=yes"
+            echo "hw.gpu.enabled=yes"
+            echo "hw.gpu.mode=swiftshader_indirect"
+          } >> "$CFG"
+
+          ACCEL="-accel on"
+          [ -e /dev/kvm ] || ACCEL="-no-accel"
+
+          nohup "$SDK_ROOT/emulator/emulator" -avd webavd $ACCEL \
+            -no-window -no-audio -no-boot-anim -no-snapshot \
+            -gpu swiftshader_indirect -memory 4096 -cores 4 \
+            > /tmp/emulator.log 2>&1 &
+          echo "Emulator PID: $!"
+
+          if ! timeout 900 bash -c 'while true; do
+              boot=$("$ADB" shell getprop sys.boot_completed 2>/dev/null | tr -d "\r")
+              [ "$boot" = "1" ] && exit 0
+              sleep 5
+            done'; then
+            echo "::error::Emulator failed to boot — last log lines:"
+            tail -n 60 /tmp/emulator.log || true
+            exit 1
+          fi
+
+          # Snappier UI for remote control
+          "$ADB" shell settings put global window_animation_scale 0 || true
+          "$ADB" shell settings put global transition_animation_scale 0 || true
+          "$ADB" shell settings put global animator_duration_scale 0 || true
+          "$ADB" shell svc power stayon true || true
+
+          echo "✅ Booted Android $("$ADB" shell getprop ro.build.version.release | tr -d '\r') (API $("$ADB" shell getprop ro.build.version.sdk | tr -d '\r'))"
+
+      # ---------------------------------------------------------------------
+      - name: "2 · Install ws-scrcpy (UI beautified with Font Awesome)"
+        run: |
+          set -e
+          mkdir -p /home/runner/ws-scrcpy
+          cd /home/runner/ws-scrcpy
+          git clone -q --depth 1 --branch v2.3.1 https://github.com/NetrisTV/ws-scrcpy.git app 2>/dev/null \
+            || git clone -q --depth 1 https://github.com/NetrisTV/ws-scrcpy.git app
+          cd app
+          npm install --no-audit --no-fund --loglevel=error
+
+          # ---- UI patcher: Font Awesome + modern dark theme + auto-icons ----
+          cat > /tmp/patch_ui.py <<'PYEOF_UI'
+          import os, sys, glob
+
+          FA_LINK = ('<link rel="stylesheet" href="https://cdnjs.cloudflare.com/'
+                     'ajax/libs/font-awesome/6.5.2/css/all.min.css" '
+                     'crossorigin="anonymous" referrerpolicy="no-referrer"/>')
+
+          STYLE = """
+          :root{--wbg:#0b1220;--wpanel:#101a30;--wline:rgba(148,163,184,.16);--wtxt:#e2e8f0;--wacc:#38bdf8}
+          html,body{background:var(--wbg)!important;color:var(--wtxt)!important;font-family:Inter,"Segoe UI",system-ui,-apple-system,sans-serif!important}
+          body{background-image:radial-gradient(900px 500px at 15% -10%,rgba(56,189,248,.12),transparent 60%),radial-gradient(900px 500px at 90% 0%,rgba(168,85,247,.10),transparent 55%)!important}
+          h1,h2,h3,h4{color:#f8fafc!important;font-weight:700!important}
+          a{color:var(--wacc)!important;text-decoration:none!important}
+          a:hover{text-decoration:underline!important}
+          button,.btn,input[type=button],input[type=submit]{background:linear-gradient(180deg,#1c2942,#141f36)!important;border:1px solid var(--wline)!important;color:var(--wtxt)!important;border-radius:10px!important;padding:.5em 1em!important;font-weight:600!important;transition:.16s ease!important;cursor:pointer!important}
+          button:hover,.btn:hover{border-color:var(--wacc)!important;box-shadow:0 0 0 3px rgba(56,189,248,.18)!important;transform:translateY(-1px)!important}
+          button:active{transform:translateY(0)!important}
+          select,textarea,input[type=text],input[type=search]{background:#0d1730!important;color:var(--wtxt)!important;border:1px solid var(--wline)!important;border-radius:8px!important;padding:.4em .6em!important;outline:none!important}
+          select:focus,textarea:focus,input:focus{border-color:var(--wacc)!important}
+          table{border-collapse:separate!important;border-spacing:0 6px!important;color:var(--wtxt)!important}
+          td,th{border:0!important;background:rgba(16,26,48,.85)!important;padding:.6em .9em!important}
+          tr>td:first-child,tr>th:first-child{border-radius:10px 0 0 10px!important}
+          tr>td:last-child,tr>th:last-child{border-radius:0 10px 10px 0!important}
+          tr:hover>td{background:rgba(23,36,66,.95)!important}
+          canvas,video{border-radius:14px!important;box-shadow:0 12px 40px rgba(0,0,0,.45)!important;background:#000}
+          input[type=checkbox],input[type=radio]{accent-color:var(--wacc)!important}
+          ::-webkit-scrollbar{width:10px;height:10px}
+          ::-webkit-scrollbar-track{background:transparent}
+          ::-webkit-scrollbar-thumb{background:#22304e;border-radius:8px;border:2px solid var(--wbg)}
+          """
+
+          SCRIPT = """
+          (function(){
+            try{
+              var map=[["reload","fa-rotate-right"],["rotate","fa-rotate"],["home","fa-house"],
+                ["back","fa-arrow-left"],["menu","fa-bars"],["overview","fa-table-cells-large"],
+                ["apps","fa-braille"],["power","fa-power-off"],["mute","fa-volume-xmark"],
+                ["volume up","fa-volume-high"],["volume down","fa-volume-low"],
+                ["keyboard","fa-keyboard"],["upload","fa-file-arrow-up"],["file","fa-file"],
+                ["clipboard","fa-clipboard"],["connect","fa-plug"],
+                ["disconnect","fa-plug-circle-xmark"],["start","fa-play"],["stop","fa-stop"],
+                ["shutdown","fa-power-off"],["restart","fa-arrows-rotate"],
+                ["settings","fa-gear"],["logs","fa-terminal"],["log","fa-terminal"],
+                ["refresh","fa-arrows-rotate"],["list","fa-list"],["save","fa-floppy-disk"],
+                ["open","fa-folder-open"]];
+              function tag(el){
+                if(!el||el.getAttribute("data-fa"))return;
+                el.setAttribute("data-fa","1");
+                var t=(el.textContent||"").trim().toLowerCase();
+                if(!t)return;
+                for(var i=0;i<map.length;i++){
+                  if(t.indexOf(map[i][0])===0){
+                    var ic=document.createElement("i");
+                    ic.className="fa-solid "+map[i][1];
+                    ic.style.marginRight=".45em";
+                    el.insertBefore(ic,el.firstChild);
+                    return;
+                  }
+                }
+              }
+              function sweep(){
+                var els=document.querySelectorAll("button,.btn");
+                for(var i=0;i<els.length;i++)tag(els[i]);
+              }
+              sweep();
+              new MutationObserver(function(){sweep();})
+                .observe(document.documentElement,{childList:true,subtree:true});
+            }catch(e){}
+          })();
+          """
+
+          BLOCK = (FA_LINK + "\n<style>" + STYLE + "</style>\n"
+                   "<script>" + SCRIPT + "</script>\n")
+
+          root = sys.argv[1] if len(sys.argv) > 1 else "."
+          changed = []
+          pats = [os.path.join(root, "public", "**", "*.html"),
+                  os.path.join(root, "dist", "**", "*.html"),
+                  os.path.join(root, "*.html")]
+          for pat in pats:
+              for f in glob.glob(pat, recursive=True):
+                  with open(f, encoding="utf-8", errors="ignore") as fh:
+                      s = fh.read()
+                  if "font-awesome" in s or "fontawesome" in s:
+                      continue
+                  if "</head>" in s:
+                      s = s.replace("</head>", BLOCK + "</head>", 1)
+                      with open(f, "w", encoding="utf-8") as fh:
+                          fh.write(s)
+                      changed.append(os.path.relpath(f, root))
+          print("UI patch applied to:", changed or "nothing found")
+          PYEOF_UI
+
+          python3 /tmp/patch_ui.py "$PWD"
+          (npm run build 2>/dev/null || npm run build:prod || npm run build:dev)
+          python3 /tmp/patch_ui.py "$PWD"   # cover dist/ output too
+
+          nohup npm start > /tmp/wsscrcpy.log 2>&1 &
+          for i in $(seq 1 30); do
+            curl -sf "http://localhost:${SCRCPY_PORT}" >/dev/null 2>&1 && break
+            sleep 4
+          done
+          if ! curl -sf "http://localhost:${SCRCPY_PORT}" >/dev/null 2>&1; then
+            if [ -f dist/index.js ]; then
+              nohup node --max-old-space-size=4096 dist/index.js > /tmp/wsscrcpy.log 2>&1 &
+              sleep 12
+            fi
+          fi
+          curl -sf "http://localhost:${SCRCPY_PORT}" >/dev/null 2>&1 \
+            || { echo "::error::ws-scrcpy failed to start"; tail -n 40 /tmp/wsscrcpy.log; exit 1; }
+          echo "✅ ws-scrcpy is up on :${SCRCPY_PORT} (Font Awesome theme injected)"
+
+      # ---------------------------------------------------------------------
+      - name: "3 · Start web dashboard (APK upload · clipboard · status)"
+        run: |
+          set -e
+          python3 -m pip install --quiet --user flask \
+            || python3 -m pip install --quiet --user --break-system-packages flask
+          if ss -ltn 2>/dev/null | grep -q ":${DASH_PORT} "; then
+            export DASH_PORT=8081
+            echo "Port ${DASH_PORT} busy — dashboard moved to 8081"
+          fi
+          mkdir -p /home/runner/dashboard
+          cd /home/runner/dashboard
+          cat > app.py <<'PYEOF_DASH'
+          import json, os, subprocess
+          from pathlib import Path
+          from flask import Flask, request, jsonify
+
+          ADB = os.environ.get("ADB", "adb")
+          PORT = int(os.environ.get("DASH_PORT", "8080"))
+          URLS_FILE = Path("/tmp/session_urls.json")
+          UPLOAD_DIR = Path("/tmp/uploads")
+          UPLOAD_DIR.mkdir(exist_ok=True)
+
+          app = Flask(__name__)
+
+          def run_adb(*args, timeout=180):
+              try:
+                  p = subprocess.run([ADB, *args], capture_output=True, text=True, timeout=timeout)
+                  return p.returncode, ((p.stdout or "") + (p.stderr or "")).strip()
+              except subprocess.TimeoutExpired:
+                  return 124, "command timed out"
+              except FileNotFoundError:
+                  return 127, "adb not found"
+
+          def prop(name):
+              return run_adb("shell", "getprop", name)[1].strip().strip("\r")
+
+          def first_device():
+              _, out = run_adb("devices")
+              for line in out.splitlines()[1:]:
+                  if line.strip().endswith("\tdevice"):
+                      return line.split("\t")[0]
+              return None
+
+          def read_urls():
+              try:
+                  return json.loads(URLS_FILE.read_text())
+              except Exception:
+                  return {"scrcpy": None, "dashboard": None}
+
+          @app.get("/status")
+          def status():
+              dev = first_device()
+              res = prop("wm size").replace("Override size:", "").strip()
+              return jsonify({
+                  "online": bool(dev),
+                  "serial": dev,
+                  "model": prop("ro.product.model"),
+                  "brand": prop("ro.product.brand"),
+                  "version": prop("ro.build.version.release"),
+                  "sdk": prop("ro.build.version.sdk"),
+                  "resolution": res,
+                  "urls": read_urls(),
+              })
+
+          @app.post("/upload")
+          def upload():
+              f = request.files.get("file")
+              if not f:
+                  return jsonify({"ok": False, "output": "No file received."}), 400
+              name = Path(f.filename).name
+              dest = UPLOAD_DIR / name
+              f.save(dest)
+              dev = first_device()
+              if not dev:
+                  return jsonify({"ok": False,
+                                  "output": "No device online — did the emulator stop?"}), 503
+              if name.lower().endswith(".apk"):
+                  rc, out = run_adb("-s", dev, "install", "-r", "-t", str(dest), timeout=600)
+                  return jsonify({"ok": rc == 0,
+                                  "output": out or ("Installed " + name)})
+              rc, out = run_adb("-s", dev, "push", str(dest), "/sdcard/Download/", timeout=600)
+              return jsonify({"ok": rc == 0,
+                              "output": out or ("Pushed to /sdcard/Download/")})
+
+          @app.post("/clipboard")
+          def clip_set():
+              data = request.get_json(silent=True) or {}
+              text = data.get("text") or ""
+              if not text.strip():
+                  return jsonify({"ok": False, "output": "Nothing to send."})
+              dev = first_device()
+              if not dev:
+                  return jsonify({"ok": False, "output": "No device online."}), 503
+              rc, out = run_adb("-s", dev, "shell", "cmd", "clipboard", "set-text", text)
+              if rc == 0:
+                  return jsonify({"ok": True,
+                                  "output": "Clipboard set on the device (cmd clipboard)."})
+              quoted = "'" + text.replace("'", "'\\''") + "'"
+              rc2, out2 = run_adb("-s", dev, "shell", "input", "text", quoted)
+              if rc2 == 0:
+                  return jsonify({"ok": True,
+                                  "output": "Typed the text into the focused field (input fallback)."})
+              return jsonify({"ok": False, "output": (out + "\n" + out2).strip()})
+
+          @app.get("/clipboard")
+          def clip_get():
+              dev = first_device()
+              if not dev:
+                  return jsonify({"ok": False, "output": "No device online."}), 503
+              rc, out = run_adb("-s", dev, "shell", "cmd", "clipboard", "get-text")
+              low = out.lower()
+              if rc == 0 and out.strip() and "error" not in low and "exception" not in low:
+                  return jsonify({"ok": True, "output": out.strip()})
+              return jsonify({"ok": False,
+                              "output": "Reading the device clipboard is blocked on this "
+                                        "Android image (modern Android forbids silent "
+                                        "clipboard reads). 'Send to device' still works."})
+
+          HTML = """<!doctype html>
+          <html lang="en">
+          <head>
+          <meta charset="utf-8">
+          <meta name="viewport" content="width=device-width,initial-scale=1">
+          <title>AVD Dashboard</title>
+          <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.2/css/all.min.css" crossorigin="anonymous" referrerpolicy="no-referrer">
+          <style>
+          :root{--bg:#0b1220;--panel:#101a30;--line:rgba(148,163,184,.16);--txt:#e2e8f0;--mut:#94a3b8;--acc:#38bdf8;--ok:#34d399;--err:#f87171}
+          *{box-sizing:border-box}
+          body{margin:0;background:radial-gradient(1000px 600px at 10% -10%,rgba(56,189,248,.12),transparent 60%),radial-gradient(900px 500px at 95% 0%,rgba(168,85,247,.10),transparent 55%),var(--bg);color:var(--txt);font-family:Inter,"Segoe UI",system-ui,sans-serif;min-height:100vh}
+          .wrap{max-width:980px;margin:0 auto;padding:28px 20px 60px}
+          header{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:26px;flex-wrap:wrap}
+          h1{font-size:1.45rem;margin:0;display:flex;align-items:center;gap:.6em}
+          h1 i{color:var(--acc)}
+          .badge{display:inline-flex;align-items:center;gap:.45em;padding:.35em .8em;border-radius:999px;border:1px solid var(--line);background:var(--panel);font-size:.85rem}
+          .dot{width:9px;height:9px;border-radius:50%;background:var(--mut);display:inline-block}
+          .dot.ok{background:var(--ok);box-shadow:0 0 8px var(--ok)}
+          .dot.err{background:var(--err)}
+          .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:18px}
+          .card{background:linear-gradient(180deg,rgba(16,26,48,.92),rgba(13,20,38,.92));border:1px solid var(--line);border-radius:16px;padding:20px}
+          .card h2{font-size:1.02rem;margin:0 0 14px;display:flex;align-items:center;gap:.55em}
+          .card h2 i{color:var(--acc)}
+          .btn{display:inline-flex;align-items:center;gap:.5em;background:linear-gradient(180deg,#1c2942,#141f36);border:1px solid var(--line);color:var(--txt);border-radius:10px;padding:.55em 1em;font-weight:600;cursor:pointer;transition:.15s;text-decoration:none;font-size:.92rem}
+          .btn:hover{border-color:var(--acc);box-shadow:0 0 0 3px rgba(56,189,248,.18);transform:translateY(-1px)}
+          .btn.primary{background:linear-gradient(180deg,#0ea5e9,#0284c7);border-color:#0284c7;color:#fff}
+          .drop{border:2px dashed var(--line);border-radius:14px;padding:26px;text-align:center;color:var(--mut);transition:.15s;cursor:pointer}
+          .drop.hover{border-color:var(--acc);background:rgba(56,189,248,.07);color:var(--txt)}
+          .bar{height:8px;border-radius:6px;background:#0d1730;overflow:hidden;margin-top:12px;display:none}
+          .bar>i{display:block;height:100%;width:0;background:linear-gradient(90deg,#0ea5e9,#38bdf8);transition:width .2s}
+          pre{background:#0a1122;border:1px solid var(--line);border-radius:10px;padding:12px;max-height:180px;overflow:auto;font-size:.8rem;color:#cbd5e1;margin:12px 0 0;white-space:pre-wrap;word-break:break-word;display:none}
+          textarea{width:100%;min-height:92px;background:#0d1730;color:var(--txt);border:1px solid var(--line);border-radius:10px;padding:10px;resize:vertical;font:inherit}
+          .row{display:flex;gap:10px;margin-top:12px;flex-wrap:wrap}
+          .meta{display:grid;grid-template-columns:auto 1fr;gap:6px 14px;font-size:.9rem;color:var(--mut)}
+          .meta b{color:var(--txt);font-weight:600}
+          .hint{color:var(--mut);font-size:.82rem;margin-top:10px;line-height:1.5}
+          code{background:#0a1122;border:1px solid var(--line);border-radius:6px;padding:.1em .35em;font-size:.85em}
+          </style>
+          </head>
+          <body>
+          <div class="wrap">
+          <header>
+            <h1><i class="fa-solid fa-mobile-screen-button"></i> AVD Web Dashboard</h1>
+            <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+              <span class="badge"><span class="dot" id="dot"></span><span id="devstate">checking…</span></span>
+              <a class="btn primary" id="scrcpyLink" href="#" target="_blank" rel="noopener"><i class="fa-solid fa-gamepad"></i> Open device control</a>
+            </div>
+          </header>
+
+          <div class="grid">
+            <section class="card">
+              <h2><i class="fa-solid fa-file-arrow-up"></i> Install APK / push file</h2>
+              <div class="drop" id="drop">
+                <i class="fa-solid fa-cloud-arrow-up" style="font-size:1.6rem"></i>
+                <p style="margin:.6em 0 0">Drag &amp; drop an <b>.apk</b> here — or click to choose</p>
+                <p class="hint" style="margin-top:.4em">Any other file type is pushed to <code>/sdcard/Download</code></p>
+              </div>
+              <input type="file" id="file" style="display:none">
+              <div class="bar" id="bar"><i></i></div>
+              <pre id="out"></pre>
+            </section>
+
+            <section class="card">
+              <h2><i class="fa-solid fa-clipboard"></i> Clipboard</h2>
+              <textarea id="clip" placeholder="Paste text here, then send it to the device…"></textarea>
+              <div class="row">
+                <button class="btn primary" id="clipSet"><i class="fa-solid fa-arrow-right-arrow-left"></i> Send to device</button>
+                <button class="btn" id="clipGet"><i class="fa-solid fa-download"></i> Read from device</button>
+              </div>
+              <pre id="clipOut"></pre>
+              <p class="hint">Sending uses <code>cmd clipboard</code> (falls back to typing). Reading may be blocked by newer Android versions.</p>
+            </section>
+
+            <section class="card" style="grid-column:1/-1">
+              <h2><i class="fa-solid fa-circle-info"></i> Device</h2>
+              <div class="meta" id="meta">Loading…</div>
+            </section>
+          </div>
+          </div>
+
+          <script>
+          const $=id=>document.getElementById(id);
+          async function refresh(){
+            try{
+              const s=await (await fetch('/status')).json();
+              $('dot').className='dot '+(s.online?'ok':'err');
+              $('devstate').textContent=s.online?('online — Android '+s.version+' (API '+s.sdk+')'):'offline';
+              const rows=[['Model',(s.brand&&s.model)?(s.brand+' '+s.model):(s.model||'—')],
+                          ['Serial',s.serial||'—'],['Android',s.version||'—'],
+                          ['API',s.sdk||'—'],['Resolution',s.resolution||'—']];
+              $('meta').innerHTML=rows.map(x=>'<span>'+x[0]+'</span><b>'+x[1]+'</b>').join('');
+              if(s.urls&&s.urls.scrcpy){$('scrcpyLink').href=s.urls.scrcpy;}
+            }catch(e){$('dot').className='dot err';$('devstate').textContent='dashboard error';}
+          }
+          refresh();setInterval(refresh,5000);
+
+          const drop=$('drop'),file=$('file'),bar=$('bar'),out=$('out');
+          drop.onclick=()=>file.click();
+          drop.ondragover=e=>{e.preventDefault();drop.classList.add('hover')};
+          drop.ondragleave=()=>drop.classList.remove('hover');
+          drop.ondrop=e=>{e.preventDefault();drop.classList.remove('hover');if(e.dataTransfer.files[0])send(e.dataTransfer.files[0])};
+          file.onchange=()=>{if(file.files[0])send(file.files[0])};
+          function send(f){
+            out.style.display='block';out.textContent='Uploading '+f.name+'…';
+            bar.style.display='block';bar.firstElementChild.style.width='0%';
+            const fd=new FormData();fd.append('file',f);
+            const x=new XMLHttpRequest();
+            x.open('POST','/upload');
+            x.upload.onprogress=e=>{if(e.lengthComputable){const p=Math.round(e.loaded/e.total*100);bar.firstElementChild.style.width=p+'%';out.textContent='Uploading '+f.name+' — '+p+'%';}};
+            x.onload=()=>{bar.style.display='none';try{const j=JSON.parse(x.responseText);out.textContent=(j.ok?'✅ ':'❌ ')+j.output;}catch(e){out.textContent=x.responseText||'error';}};
+            x.onerror=()=>{bar.style.display='none';out.textContent='❌ upload failed (network)';};
+            x.send(fd);
+          }
+          function show(el,ok,msg){el.style.display='block';el.textContent=(ok?'✅ ':'⚠️ ')+msg;}
+          $('clipSet').onclick=async()=>{
+            const t=$('clip').value;
+            if(!t.trim())return show($('clipOut'),false,'Type some text first.');
+            try{const j=await (await fetch('/clipboard',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text:t})})).json();show($('clipOut'),j.ok,j.output);}
+            catch(e){show($('clipOut'),false,'request failed');}
+          };
+          $('clipGet').onclick=async()=>{
+            try{const j=await (await fetch('/clipboard')).json();show($('clipOut'),j.ok,j.output);if(j.ok)$('clip').value=j.output;}
+            catch(e){show($('clipOut'),false,'request failed');}
+          };
+          </script>
+          </body>
+          </html>
+          """
+
+          @app.get("/")
+          def index():
+              return HTML
+
+          if __name__ == "__main__":
+              app.run(host="0.0.0.0", port=PORT, threaded=True)
+          PYEOF_DASH
+          nohup python3 app.py > /tmp/dashboard.log 2>&1 &
+          for i in $(seq 1 20); do
+            curl -sf "http://localhost:${DASH_PORT}/status" >/dev/null 2>&1 && break
+            sleep 3
+          done
+          curl -sf "http://localhost:${DASH_PORT}/status" >/dev/null 2>&1 \
+            || { echo "::error::dashboard failed to start"; tail -n 40 /tmp/dashboard.log; exit 1; }
+          echo "✅ Dashboard is up on :${DASH_PORT}"
+
+      # ---------------------------------------------------------------------
+      - name: "4 · Open Cloudflare tunnels and publish the links"
+        run: |
+          set -e
+          curl -sL -o /tmp/cloudflared \
+            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+          chmod +x /tmp/cloudflared
+
+          nohup /tmp/cloudflared tunnel --no-autoupdate \
+            --url "http://localhost:${SCRCPY_PORT}" > /tmp/cf-scrcpy.log 2>&1 &
+          nohup /tmp/cloudflared tunnel --no-autoupdate \
+            --url "http://localhost:${DASH_PORT}" > /tmp/cf-dash.log 2>&1 &
+
+          S=""; D=""
+          for i in $(seq 1 40); do
+            S=$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' /tmp/cf-scrcpy.log | head -n1)
+            D=$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' /tmp/cf-dash.log | head -n1)
+            [ -n "$S" ] && [ -n "$D" ] && break
+            sleep 3
+          done
+          if [ -z "$S" ] || [ -z "$D" ]; then
+            echo "::error::Could not obtain trycloudflare URLs"
+            tail -n 30 /tmp/cf-scrcpy.log /tmp/cf-dash.log || true
+            exit 1
+          fi
+
+          printf '%s\n' "$S" > /tmp/scrcpy_url
+          printf '%s\n' "$D" > /tmp/dash_url
+          printf '{"scrcpy":"%s","dashboard":"%s"}\n' "$S" "$D" > /tmp/session_urls.json
+          cat > /tmp/session_info.txt <<EOF
+          ws-scrcpy : $S
+          Dashboard : $D
+          Started (UTC): $(date -u '+%Y-%m-%d %H:%M')
+          Android API: $API · Session: $DURATION_MIN min
+          EOF
+
+          {
+            echo ""
+            echo "## 🔗 Your AVD is live — open these links"
+            echo ""
+            echo "| What | Link |"
+            echo "|------|------|"
+            echo "| 🎮 **Control the device** (ws-scrcpy) | [$S]($S) |"
+            echo "| 🛠 **Dashboard** — APK upload · clipboard · status | [$D]($D) |"
+            echo ""
+            echo "**How to use**"
+            echo "1. Open the ws-scrcpy link → pick the device → choose client **H264** (smoothest) or **MJPEG** → **Connect**."
+            echo "2. Control the device with mouse + keyboard; the toolbar has Home / Back / Rotate / Volume."
+            echo "3. To install an app, open the Dashboard link and drop an \`.apk\` into the upload zone."
+            echo ""
+            echo "⏳ Session runs for **$DURATION_MIN minutes** — cancel the run to stop early (recording is uploaded as an artifact)."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "::notice::ws-scrcpy (control device): $S"
+          echo "::notice::Dashboard (APK / clipboard): $D"
+
+      # ---------------------------------------------------------------------
+      - name: "5 · Start screen recorder"
+        if: env.RECORD == '1'
+        run: |
+          mkdir -p "$REC_DIR"
+          cat > /tmp/record_loop.sh <<'RECEOF'
+          #!/usr/bin/env bash
+          ADB_BIN="$1"; DIR="$2"
+          i=0
+          while [ -f "$DIR/.keep_recording" ]; do
+            "$ADB_BIN" exec-out screenrecord --output-format=h264 --time-limit 180 \
+              --bit-rate 4000000 > "$DIR/chunk_$(printf '%04d' "$i").h264" 2>/dev/null || sleep 2
+            i=$((i+1))
+            # rolling window: keep total under ~4 GB, drop oldest chunks first
+            while [ "$(du -sm "$DIR" 2>/dev/null | cut -f1)" -gt 4200 ]; do
+              OLD="$(ls "$DIR"/chunk_*.h264 2>/dev/null | sort | head -n1)"
+              [ -n "$OLD" ] && rm -f "$OLD" || break
+            done
+          done
+          RECEOF
+          chmod +x /tmp/record_loop.sh
+          touch "$REC_DIR/.keep_recording"
+          nohup /tmp/record_loop.sh "$ADB" "$REC_DIR" > /tmp/record.log 2>&1 &
+          echo "🔴 Recording started (180 s chunks, ~4 GB rolling window)"
+
+      # ---------------------------------------------------------------------
+      - name: "6 · Keep session alive — links are re-printed here every 5 min"
+        run: |
+          # cap at 350 min so the finalize steps always run cleanly inside the job limit
+          MIN="$DURATION_MIN"
+          [ "$MIN" -gt 350 ] && MIN=350
+          END=$((SECONDS + MIN * 60))
+          while [ $SECONDS -lt $END ]; do
+            S=$(cat /tmp/scrcpy_url 2>/dev/null || echo n/a)
+            D=$(cat /tmp/dash_url 2>/dev/null || echo n/a)
+            echo "[$(date -u '+%H:%M:%S')] alive · ws-scrcpy: $S · dashboard: $D"
+            curl -sf -o /dev/null "http://localhost:${SCRCPY_PORT}" || echo "WARN: ws-scrcpy not responding"
+            curl -sf -o /dev/null "http://localhost:${DASH_PORT}" || echo "WARN: dashboard not responding"
+            "$ADB" shell echo device-ok >/dev/null 2>&1 || echo "WARN: device not responding"
+            sleep 300
+          done
+
+      # ---------------------------------------------------------------------
+      - name: "7 · Finalize — build recording & prepare artifacts"
+        if: always()
+        run: |
+          OUT="$GITHUB_WORKSPACE/avd-session"
+          mkdir -p "$OUT"
+          [ -f /tmp/session_info.txt ] && cp /tmp/session_info.txt "$OUT/" || true
+
+          if [ "$RECORD" = "1" ] && [ -d "$REC_DIR" ]; then
+            rm -f "$REC_DIR/.keep_recording"
+            for i in $(seq 1 90); do
+              pgrep -f screenrecord >/dev/null 2>&1 || break
+              sleep 2
+            done
+            command -v ffmpeg >/dev/null 2>&1 || sudo apt-get install -y -qq ffmpeg >/dev/null 2>&1 || true
+            cat "$REC_DIR"/chunk_*.h264 > /tmp/all.h264 2>/dev/null || true
+            if [ -s /tmp/all.h264 ]; then
+              ffmpeg -y -loglevel error -f h264 -framerate 30 -i /tmp/all.h264 \
+                -c:v copy -movflags +faststart "$OUT/session-recording.mp4" \
+                || cp /tmp/all.h264 "$OUT/session-recording.h264"
+            fi
+          fi
+          echo "### 🎬 Session artifacts" >> "$GITHUB_STEP_SUMMARY"
+          echo "The \`avd-session\` artifact (screen recording + connection info) is attached to this run if recording was enabled." >> "$GITHUB_STEP_SUMMARY"
+          ls -alh "$OUT" || true
+
+      - name: Upload session artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: avd-session
+          path: avd-session/
+          if-no-files-found: ignore
